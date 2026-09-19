@@ -102,17 +102,39 @@ public class TypeSchemaResolver {
     private final Swagger3AnnotationReader swagger3 = new Swagger3AnnotationReader();
     private final JavaDocReader javadoc = new JavaDocReader();
 
+    /** 泛型实例化 schema 命名风格: pascal = Apifox 风格拼接 (PagingInfoX), false = 书名号 (PagingInfo«X») */
+    private final boolean pascalNaming;
+
     private final List<Path> sourceRoots;
     private final Map<String, Path> sourceBySimpleName = new HashMap<>();
     /**
-     * 已解析 schema 缓存. key: 类简单名 或 泛型实例化名 (ResultModel«UserVO»).
+     * 已解析 schema 缓存. key: 类简单名 或 泛型实例化名 (ResultModel«UserVO» / ResultUserVO).
      * 解析前先放入占位对象, 保证自引用类型命中缓存返回 $ref.
      */
     private final Map<String, Schema> schemaCache = new HashMap<>();
     private static final JavaParser SHARED_PARSER = new JavaParser();
 
     public TypeSchemaResolver(List<Path> sourceRoots) {
+        this(sourceRoots, "guillemet");
+    }
+
+    /**
+     * @param schemaNameStyle 泛型实例化 schema 命名风格:
+     *                        "guillemet" (默认, PagingInfo«X») / "pascal" (PagingInfoX, Apifox 风格),
+     *                        大小写不敏感; 其他值告警并回退 guillemet
+     */
+    public TypeSchemaResolver(List<Path> sourceRoots, String schemaNameStyle) {
         this.sourceRoots = sourceRoots;
+        if ("pascal".equalsIgnoreCase(schemaNameStyle)) {
+            this.pascalNaming = true;
+        } else {
+            if (schemaNameStyle != null && !schemaNameStyle.isBlank()
+                    && !"guillemet".equalsIgnoreCase(schemaNameStyle)) {
+                log.warn("Unknown schemaNameStyle '{}', falling back to 'guillemet' (supported: guillemet, pascal)",
+                        schemaNameStyle);
+            }
+            this.pascalNaming = false;
+        }
         indexSources();
     }
 
@@ -353,7 +375,30 @@ public class TypeSchemaResolver {
     }
 
     private String genericKey(String rawName, List<String> typeArgs) {
+        if (pascalNaming) {
+            // Apifox 风格: 原始类名 + 实参递归压平拼接, PagingInfo<List<UserVO>> → PagingInfoListUserVO
+            StringBuilder sb = new StringBuilder(rawName);
+            for (String arg : typeArgs) sb.append(flattenTypeArg(arg));
+            return sb.toString();
+        }
         return rawName + "«" + String.join(",", typeArgs) + "»";
+    }
+
+    /** pascal 风格的类型名压平: "List<UserVO>" → "ListUserVO"; "UserVO[]" → "UserVOArray" */
+    private static String flattenTypeArg(String typeStr) {
+        String s = typeStr.trim();
+        if (s.endsWith("[]")) {
+            return flattenTypeArg(s.substring(0, s.length() - 2)) + "Array";
+        }
+        int lt = s.indexOf('<');
+        if (lt > 0 && s.endsWith(">")) {
+            StringBuilder sb = new StringBuilder(s.substring(0, lt));
+            for (String arg : splitTopLevel(s.substring(lt + 1, s.length() - 1))) {
+                sb.append(flattenTypeArg(arg.trim()));
+            }
+            return sb.toString();
+        }
+        return s;
     }
 
     /** 类的泛型形参名 zip 实参列表: <T, R> + [UserVO, OrderVO] → {T=UserVO, R=OrderVO} */

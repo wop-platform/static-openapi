@@ -74,6 +74,10 @@ public class OpenApiMojo extends AbstractMojo {
     @Parameter(property = "prettyPrint")
     private Boolean prettyPrint;
 
+    /** 泛型实例化 schema 命名风格: guillemet (默认) / pascal (Apifox 风格) */
+    @Parameter(property = "schemaNameStyle")
+    private String schemaNameStyle;
+
     @Override
     public void execute() throws MojoExecutionException {
         // 直接调用 (default-cli) 只在 reactor 根模块执行一次:
@@ -128,6 +132,9 @@ public class OpenApiMojo extends AbstractMojo {
             }
             if (packages != null && !packages.isEmpty()) {
                 config.setPackages(packages);
+            }
+            if (schemaNameStyle != null && !schemaNameStyle.isEmpty()) {
+                config.setSchemaNameStyle(schemaNameStyle);
             }
 
             log.info("static-openapi starting. project={}, projectDir={}, packages={}",

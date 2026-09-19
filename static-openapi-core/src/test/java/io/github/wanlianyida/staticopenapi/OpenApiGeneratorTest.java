@@ -327,4 +327,68 @@ class OpenApiGeneratorTest {
                 multiDoc.at("/paths/~1orders~1{id}/get/responses/200/content/application~1json/schema/$ref").asText());
         assertTrue(multiDoc.at("/components/schemas/OrderDTO/properties").has("orderNo"));
     }
+
+    @Test
+    void pascalSchemaNameStyleFlattensGenerics() throws Exception {
+        // Apifox 风格命名: PagingInfo<UserVO> → "PagingInfoUserVO" (嵌套与数组递归压平, 无非法字符)
+        Path pascalDir = tempDir.resolve("pascal");
+        Path pc = pascalDir.resolve("src/main/java/com/example");
+        Files.createDirectories(pc.resolve("controller"));
+        Files.createDirectories(pc.resolve("model"));
+        Files.write(pc.resolve("model/PagingInfo.java"), src(
+                "package com.example.model;",
+                "import java.util.List;",
+                "/** 分页包装 */",
+                "public class PagingInfo<T> {",
+                "    private List<T> records;",
+                "}").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        Files.write(pc.resolve("model/UserVO.java"), src(
+                "package com.example.model;",
+                "/** 用户 */",
+                "public class UserVO {",
+                "    private java.util.List<OrderVO> orders;",
+                "}").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        Files.write(pc.resolve("model/OrderVO.java"), src(
+                "package com.example.model;",
+                "/** 订单 */",
+                "public class OrderVO {",
+                "    private String orderNo;",
+                "}").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        Files.write(pc.resolve("controller/PagingController.java"), src(
+                "package com.example.controller;",
+                "import com.example.model.*;",
+                "import org.springframework.web.bind.annotation.*;",
+                "import java.util.List;",
+                "/** 分页 */",
+                "@RestController",
+                "public class PagingController {",
+                "    /** 分页查用户 */",
+                "    @GetMapping(\"/users\")",
+                "    public PagingInfo<UserVO> users() { return null; }",
+                "    /** 嵌套泛型 */",
+                "    @GetMapping(\"/nested\")",
+                "    public PagingInfo<List<UserVO>> nested() { return null; }",
+                "}").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+
+        GeneratorConfig config = new GeneratorConfig()
+                .setProjectDir(pascalDir.toString())
+                .setOutPath(tempDir.resolve("out-pascal").toString())
+                .setSchemaNameStyle("pascal");
+        JsonNode pascalDoc = new ObjectMapper().readTree(
+                Files.readAllBytes(new OpenApiGenerator(config).generate()));
+
+        // PagingInfo<UserVO> → PagingInfoUserVO
+        JsonNode paged = pascalDoc.at("/components/schemas/PagingInfoUserVO");
+        assertEquals("#/components/schemas/UserVO", paged.at("/properties/records/items/$ref").asText());
+        // 嵌套: PagingInfo<List<UserVO>> → PagingInfoListUserVO, records 为数组的数组
+        JsonNode nested = pascalDoc.at("/components/schemas/PagingInfoListUserVO");
+        assertEquals("#/components/schemas/UserVO", nested.at("/properties/records/items/items/$ref").asText());
+        // 字段泛型指向正确
+        assertEquals("#/components/schemas/OrderVO",
+                pascalDoc.at("/components/schemas/UserVO/properties/orders/items/$ref").asText());
+        // pascal 风格下所有 schema key 都是规范允许的字符
+        for (String key : (Iterable<String>) pascalDoc.at("/components/schemas")::fieldNames) {
+            assertTrue(key.matches("[a-zA-Z0-9.\\-_]+"), "illegal schema key: " + key);
+        }
+    }
 }

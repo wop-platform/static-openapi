@@ -26,6 +26,7 @@ public final class ConfigMerger {
         if (root.hasNonNull("apiVersion"))     config.setApiVersion(root.get("apiVersion").asText());
         if (root.hasNonNull("prettyPrint"))    config.setPrettyPrint(root.get("prettyPrint").asBoolean());
         if (root.hasNonNull("errorResponseSchema")) config.setErrorResponseSchema(root.get("errorResponseSchema").asText());
+        if (root.hasNonNull("schemaNameStyle"))     config.setSchemaNameStyle(root.get("schemaNameStyle").asText());
 
         if (root.has("packages") && root.get("packages").isArray()) {
             if (config.getPackages().isEmpty()) {

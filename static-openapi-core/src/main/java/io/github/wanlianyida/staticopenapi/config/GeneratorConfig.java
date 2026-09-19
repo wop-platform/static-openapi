@@ -20,6 +20,8 @@ public class GeneratorConfig {
     private Boolean prettyPrint;
     /** 通用错误响应 schema 引用 (null = 不生成 500 response). 例如 "ResultModel" */
     private String errorResponseSchema;
+    /** 泛型实例化 schema 的命名风格: guillemet (默认, PagingInfo«X») / pascal (PagingInfoX, Apifox 风格) */
+    private String schemaNameStyle;
 
     public String getProjectName() { return projectName != null ? projectName : "openapi-doc"; }
     public GeneratorConfig setProjectName(String projectName) { this.projectName = projectName; return this; }
@@ -51,4 +53,7 @@ public class GeneratorConfig {
 
     public String getErrorResponseSchema() { return errorResponseSchema; }
     public GeneratorConfig setErrorResponseSchema(String errorResponseSchema) { this.errorResponseSchema = errorResponseSchema; return this; }
+
+    public String getSchemaNameStyle() { return schemaNameStyle != null ? schemaNameStyle : "guillemet"; }
+    public GeneratorConfig setSchemaNameStyle(String schemaNameStyle) { this.schemaNameStyle = schemaNameStyle; return this; }
 }
