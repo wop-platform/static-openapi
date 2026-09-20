@@ -1,12 +1,11 @@
 package io.github.wanlianyida.staticopenapi;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParseResult;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.TypeDeclaration;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import io.github.wanlianyida.staticopenapi.config.GeneratorConfig;
 import io.github.wanlianyida.staticopenapi.merge.OpenApiMerger;
 import io.github.wanlianyida.staticopenapi.model.Components;
@@ -22,6 +21,7 @@ import io.github.wanlianyida.staticopenapi.model.Tag;
 import io.github.wanlianyida.staticopenapi.output.OpenApiWriter;
 import io.github.wanlianyida.staticopenapi.reader.AnnotationUtils;
 import io.github.wanlianyida.staticopenapi.reader.JavaDocReader;
+import io.github.wanlianyida.staticopenapi.reader.SourceParser;
 import io.github.wanlianyida.staticopenapi.reader.SpringWebAnnotationReader;
 import io.github.wanlianyida.staticopenapi.reader.Swagger2AnnotationReader;
 import io.github.wanlianyida.staticopenapi.reader.Swagger3AnnotationReader;
@@ -34,9 +34,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -57,8 +61,17 @@ public class OpenApiGenerator {
 
     private static final Logger log = LoggerFactory.getLogger(OpenApiGenerator.class);
 
-    /** 共享 JavaParser 单例 (创建开销大, 复用) */
-    private static final JavaParser SHARED_PARSER = new JavaParser();
+    /** 共享源码解析缓存: 每个文件整个流程只解析一次 (controller 扫描/DTO/接口/父类共用) */
+    private final SourceParser sourceParser = new SourceParser();
+
+    /** operationId 去重 (每次 generate 重置): 同名方法/ANY 展开都会产生多个 operation */
+    private final Set<String> usedOperationIds = new HashSet<>();
+
+    /** errorResponseSchema 解析出的实际 schema 名 (可能与配置名不同: @Schema/@ApiModel 重命名) */
+    private String errorResponseSchemaName;
+
+    /** 路径模板变量: {uid} / {id:\d+} → 变量名 */
+    private static final Pattern PATH_VAR_PATTERN = Pattern.compile("\\{([^}:]+)");
 
     /** OpenAPI 3.1 path item 下的标准 HTTP 动词 */
     private static final List<String> STANDARD_METHODS = List.of(
@@ -68,7 +81,7 @@ public class OpenApiGenerator {
     private static final String RESPONSE_200 = "200";
     private static final String RESPONSE_500 = "500";
 
-    /** 浅复制 operation (用于 ANY method / 多 path 展开) */
+    /** 复制 operation (用于 ANY method / 多 path 展开): parameter/response 逐个新建, 不共享实例 */
     private static Operation copyOperation(Operation src) {
         Operation copy = new Operation()
                 .setSummary(src.getSummary())
@@ -77,8 +90,20 @@ public class OpenApiGenerator {
                 .setDeprecated(src.isDeprecated())
                 .setRequestBody(src.getRequestBody());
         copy.setTags(new java.util.ArrayList<>(src.getTags()));
-        for (var p : src.getParameters()) copy.addParameter(p);
-        for (var e : src.getResponses().entrySet()) copy.addResponse(e.getKey(), e.getValue());
+        for (var p : src.getParameters()) {
+            copy.addParameter(new io.github.wanlianyida.staticopenapi.model.Parameter()
+                    .setName(p.getName())
+                    .setIn(p.getIn())
+                    .setDescription(p.getDescription())
+                    .setRequired(p.isRequired())
+                    .setSchema(p.getSchema())
+                    .setExample(p.getExample()));
+        }
+        for (var e : src.getResponses().entrySet()) {
+            Response r = new Response().setDescription(e.getValue().getDescription());
+            e.getValue().getContent().forEach(r::addContent);
+            copy.addResponse(e.getKey(), r);
+        }
         return copy;
     }
 
@@ -98,6 +123,8 @@ public class OpenApiGenerator {
     public Path generate() throws IOException {
         log.info("OpenAPI generator starting. project={}, version={}",
                 config.getProjectName(), config.getOpenapiVersion());
+        usedOperationIds.clear();
+        errorResponseSchemaName = null;
 
         Path projectDir = Paths.get(config.getProjectDir());
         List<Path> sourceRoots = detectSourceRoots(projectDir);
@@ -108,7 +135,8 @@ public class OpenApiGenerator {
             log.info("Using source root: {}", root.toAbsolutePath());
         }
 
-        TypeSchemaResolver typeResolver = new TypeSchemaResolver(sourceRoots, config.getSchemaNameStyle());
+        TypeSchemaResolver typeResolver =
+                new TypeSchemaResolver(sourceRoots, config.getSchemaNameStyle(), sourceParser);
 
         OpenApiDocument doc = new OpenApiDocument()
                 .setOpenapi(config.getOpenapiVersion())
@@ -116,13 +144,22 @@ public class OpenApiGenerator {
         Components components = doc.getComponents();
         Map<String, Tag> tagMap = new LinkedHashMap<>();
 
+        // errorResponseSchema 先解析进 components (buildOperation 依赖解析出的实际 schema 名),
+        // 避免 500 响应 $ref 悬空
+        resolveErrorSchemaIntoComponents(typeResolver, components);
+
+        // 排序遍历保证输出顺序与文件系统遍历顺序无关 (可重复构建, 便于 diff)
         for (Path root : sourceRoots) {
             if (!Files.isDirectory(root)) continue;
+            List<Path> javaFiles = new ArrayList<>();
             try (Stream<Path> stream = Files.walk(root)) {
-                stream.filter(p -> p.toString().endsWith(".java"))
-                        .forEach(javaFile -> parseOneController(javaFile, typeResolver, doc, tagMap, components));
+                stream.filter(p -> p.toString().endsWith(".java")).forEach(javaFiles::add);
             } catch (IOException e) {
                 log.warn("Failed to walk {}: {}", root, e.getMessage());
+            }
+            javaFiles.sort(Path::compareTo);
+            for (Path javaFile : javaFiles) {
+                parseOneController(javaFile, typeResolver, doc, tagMap, components);
             }
         }
 
@@ -132,6 +169,22 @@ public class OpenApiGenerator {
         Path output = writer.write(doc, config);
         log.info("OpenAPI spec written to: {}", output);
         return output;
+    }
+
+    /** errorResponseSchema 指向的类主动解析进 components; 解析不到时告警 (500 $ref 会悬空) */
+    private void resolveErrorSchemaIntoComponents(TypeSchemaResolver typeResolver, Components components) {
+        String errSchema = config.getErrorResponseSchema();
+        if (errSchema == null || errSchema.isEmpty()) return;
+        Schema resolved = typeResolver.resolveSchemaByName(errSchema, components.getSchemas());
+        if (resolved.getRef() != null) {
+            errorResponseSchemaName =
+                    resolved.getRef().substring(resolved.getRef().lastIndexOf('/') + 1);
+            log.info("errorResponseSchema '{}' resolved as components.schemas.{}", errSchema, errorResponseSchemaName);
+        } else {
+            errorResponseSchemaName = errSchema;
+            log.warn("errorResponseSchema '{}' not found in source roots; 500 responses reference a missing schema",
+                    errSchema);
+        }
     }
 
     /** 递归查找时不进入的目录 (构建产物/版本控制/IDE 等) */
@@ -180,15 +233,8 @@ public class OpenApiGenerator {
     private void parseOneController(Path javaFile, TypeSchemaResolver typeResolver,
                                      OpenApiDocument doc, Map<String, Tag> tagMap, Components components) {
 
-        CompilationUnit unit;
-        try {
-            ParseResult<CompilationUnit> result = SHARED_PARSER.parse(javaFile);
-            if (!result.isSuccessful()) return;
-            unit = result.getResult().orElse(null);
-            if (unit == null) return;
-        } catch (IOException e) {
-            return;
-        }
+        CompilationUnit unit = sourceParser.parse(javaFile);
+        if (unit == null) return;
 
         for (TypeDeclaration<?> td : unit.getTypes()) {
             if (!(td instanceof ClassOrInterfaceDeclaration)) continue;
@@ -213,32 +259,57 @@ public class OpenApiGenerator {
                 SpringWebAnnotationReader.MappingInfo mapping = springWeb.readMapping(method);
                 if (mapping == null) continue;
 
-                Operation operation = buildOperation(method, classTags, typeResolver, components);
-
-                // 多前缀 × 多路径 × 多 HTTP method 全部展开
-                boolean first = true;
+                // 先展开全部完整路径 (base × sub 去重), 供参数位置推断
+                List<String> fullPaths = new ArrayList<>();
                 for (String base : basePaths) {
                     for (String sub : mapping.paths) {
                         String fullPath = joinPath(base, sub);
-                        if (fullPath.isEmpty()) continue;
-                        for (String httpMethod : mapping.httpMethods) {
-                            if (SpringWebAnnotationReader.ANY_METHOD.equals(httpMethod)) {
-                                log.warn("@RequestMapping on {}.{}() without method, replicating to all standard methods",
-                                        cls.getNameAsString(), method.getNameAsString());
-                                for (String m : STANDARD_METHODS) {
-                                    PathItem item = doc.getPaths().computeIfAbsent(fullPath, k -> new PathItem());
-                                    item.addOperation(m, first ? operation : copyOperation(operation));
-                                    first = false;
-                                }
-                            } else {
-                                PathItem item = doc.getPaths().computeIfAbsent(fullPath, k -> new PathItem());
-                                item.addOperation(httpMethod, first ? operation : copyOperation(operation));
-                                first = false;
+                        if (!fullPath.isEmpty() && !fullPaths.contains(fullPath)) fullPaths.add(fullPath);
+                    }
+                }
+                if (fullPaths.isEmpty()) continue;
+
+                Operation operation = buildOperation(method, classTags, typeResolver, components, fullPaths);
+                String baseOperationId = operation.getOperationId();
+
+                // 多前缀 × 多路径 × 多 HTTP method 全部展开, 每个 operation 独立 operationId
+                boolean first = true;
+                for (String fullPath : fullPaths) {
+                    PathItem item = doc.getPaths().computeIfAbsent(fullPath, k -> new PathItem());
+                    for (String httpMethod : mapping.httpMethods) {
+                        List<String> verbs = SpringWebAnnotationReader.ANY_METHOD.equals(httpMethod)
+                                ? STANDARD_METHODS
+                                : List.of(httpMethod);
+                        if (SpringWebAnnotationReader.ANY_METHOD.equals(httpMethod)) {
+                            log.warn("@RequestMapping on {}.{}() without method, replicating to all standard methods",
+                                    cls.getNameAsString(), method.getNameAsString());
+                        }
+                        for (String verb : verbs) {
+                            if (item.getOperations().containsKey(verb)) {
+                                log.warn("Duplicate {} {} in {}, previous operation overwritten", verb, fullPath, javaFile);
                             }
+                            Operation toAdd;
+                            if (first) {
+                                toAdd = operation;
+                                first = false;
+                            } else {
+                                toAdd = copyOperation(operation);
+                            }
+                            toAdd.setOperationId(uniqueOperationId(baseOperationId));
+                            item.addOperation(verb, toAdd);
                         }
                     }
                 }
             }
+        }
+    }
+
+    /** operationId 去重: 冲突时追加 _2/_3… (OpenAPI 规定 operationId 全文档唯一) */
+    private String uniqueOperationId(String base) {
+        if (usedOperationIds.add(base)) return base;
+        for (int i = 2; ; i++) {
+            String candidate = base + "_" + i;
+            if (usedOperationIds.add(candidate)) return candidate;
         }
     }
 
@@ -259,8 +330,8 @@ public class OpenApiGenerator {
     }
 
     /**
-     * 收集 controller 上的方法 + 它 implements 接口上的方法.
-     * 重载方法 (同名不同参数类型) 各自保留; 接口方法签名写法与实现不一致时按名字+参数个数兜底匹配.
+     * 收集 controller 上的方法 + 它继承链 (父类/接口, 递归) 上的方法.
+     * 重载方法 (同名不同参数类型) 各自保留; 继承方法签名写法与实现不一致时按名字+参数个数兜底匹配.
      */
     private Map<MethodKey, MethodDeclaration> collectMethods(ClassOrInterfaceDeclaration cls,
                                                               TypeSchemaResolver typeResolver) {
@@ -269,52 +340,61 @@ public class OpenApiGenerator {
             if (m == null || !m.isPublic()) continue;
             methods.put(new MethodKey(m), m);
         }
-        for (var implementedType : cls.getImplementedTypes()) {
-            String ifName = stripGenerics(implementedType.getNameAsString());
-            Path ifFile = typeResolver.getSourceBySimpleName().get(ifName);
-            if (ifFile == null) continue;
-            try {
-                CompilationUnit ifUnit = SHARED_PARSER.parse(ifFile).getResult().orElse(null);
-                if (ifUnit == null) continue;
-                for (TypeDeclaration<?> ifTd : ifUnit.getTypes()) {
-                    if (!(ifTd instanceof ClassOrInterfaceDeclaration)) continue;
-                    if (!((ClassOrInterfaceDeclaration) ifTd).isInterface()) continue;
-                    for (MethodDeclaration ifMethod : ((ClassOrInterfaceDeclaration) ifTd).getMethods()) {
-                        if (ifMethod == null) continue;
-                        mergeInterfaceMethod(methods, ifMethod);
-                    }
-                }
-            } catch (IOException ignore) {
-                // skip unreachable interface
-            }
-        }
+        Set<String> visited = new HashSet<>();
+        visited.add(cls.getNameAsString());
+        collectFromSupertypes(cls, typeResolver, methods, visited);
         return methods;
     }
 
-    /** 接口方法合并: 精确签名匹配; 不一致时按 name+参数个数兜底, mapping 注解优先取接口侧 */
-    private void mergeInterfaceMethod(Map<MethodKey, MethodDeclaration> methods, MethodDeclaration ifMethod) {
-        MethodKey key = new MethodKey(ifMethod);
+    /** 递归合并 extends 父类 + implements 接口上的 public 映射方法 (BaseController 模式) */
+    private void collectFromSupertypes(ClassOrInterfaceDeclaration cls, TypeSchemaResolver typeResolver,
+                                       Map<MethodKey, MethodDeclaration> methods, Set<String> visited) {
+        List<ClassOrInterfaceType> supertypes = new ArrayList<>(cls.getExtendedTypes());
+        supertypes.addAll(cls.getImplementedTypes());
+        for (ClassOrInterfaceType superType : supertypes) {
+            String superName = stripGenerics(superType.getNameAsString());
+            if (!visited.add(superName)) continue;
+            Path superFile = typeResolver.getSourceBySimpleName().get(superName);
+            if (superFile == null) continue;
+            CompilationUnit superUnit = sourceParser.parse(superFile);
+            if (superUnit == null) continue;
+            for (TypeDeclaration<?> td : superUnit.getTypes()) {
+                if (!(td instanceof ClassOrInterfaceDeclaration)) continue;
+                ClassOrInterfaceDeclaration superCls = (ClassOrInterfaceDeclaration) td;
+                if (!superCls.getNameAsString().equals(superName)) continue;
+                for (MethodDeclaration superMethod : superCls.getMethods()) {
+                    if (superMethod == null || superMethod.isPrivate()) continue;
+                    mergeInheritedMethod(methods, superMethod);
+                }
+                collectFromSupertypes(superCls, typeResolver, methods, visited);
+            }
+        }
+    }
+
+    /** 继承方法合并: 精确签名匹配; 不一致时按 name+参数个数兜底, mapping 注解优先取继承侧 */
+    private void mergeInheritedMethod(Map<MethodKey, MethodDeclaration> methods, MethodDeclaration inherited) {
+        MethodKey key = new MethodKey(inherited);
         MethodDeclaration existing = methods.get(key);
         if (existing != null) {
-            if (!hasMapping(existing) && hasMapping(ifMethod)) {
-                methods.put(key, ifMethod);
+            if (!hasMapping(existing) && hasMapping(inherited)) {
+                methods.put(key, inherited);
             }
             return;
         }
         MethodDeclaration sameNameCount = null;
         MethodKey sameNameCountKey = null;
         for (Map.Entry<MethodKey, MethodDeclaration> e : methods.entrySet()) {
-            if (e.getKey().matchesLoosely(ifMethod)) {
+            if (e.getKey().matchesLoosely(inherited)) {
                 sameNameCount = e.getValue();
                 sameNameCountKey = e.getKey();
                 break;
             }
         }
         if (sameNameCount == null) {
-            methods.put(key, ifMethod);
-        } else if (!hasMapping(sameNameCount) && hasMapping(ifMethod)) {
+            methods.put(key, inherited);
+        } else if (!hasMapping(sameNameCount) && hasMapping(inherited)) {
             methods.remove(sameNameCountKey);
-            methods.put(key, ifMethod);
+            methods.put(key, inherited);
         }
     }
 
@@ -337,7 +417,8 @@ public class OpenApiGenerator {
     }
 
     private Operation buildOperation(MethodDeclaration method, Map<String, Tag> classTags,
-                                      TypeSchemaResolver typeResolver, Components components) {
+                                      TypeSchemaResolver typeResolver, Components components,
+                                      List<String> pathTemplates) {
 
         Swagger3AnnotationReader.OperationInfo ann3 = swagger3.readOperation(method);
         Swagger2AnnotationReader.OperationAnnotation ann2 = swagger2.readOperation(method);
@@ -376,7 +457,7 @@ public class OpenApiGenerator {
         // 4. parameters (跳过 @RequestBody 参数与 hidden 参数)
         for (Parameter param : method.getParameters()) {
             if (isRequestBodyParam(param) || AnnotationUtils.isHidden(param)) continue;
-            operation.addParameter(buildParameter(param, typeResolver, components));
+            operation.addParameter(buildParameter(param, typeResolver, components, pathTemplates));
         }
 
         // 5. request body: 第一个带 @RequestBody 注解的参数
@@ -440,7 +521,7 @@ public class OpenApiGenerator {
                         .addContent(CONTENT_TYPE_JSON, new MediaType().setSchema(respSchema)));
             }
         }
-        String errSchema = config.getErrorResponseSchema();
+        String errSchema = errorResponseSchemaName;
         if (errSchema != null && !errSchema.isEmpty() && !has500) {
             operation.addResponse(RESPONSE_500, new Response()
                     .setDescription("Internal Server Error")
@@ -459,19 +540,26 @@ public class OpenApiGenerator {
     }
 
     private io.github.wanlianyida.staticopenapi.model.Parameter buildParameter(
-            Parameter param, TypeSchemaResolver typeResolver, Components components) {
+            Parameter param, TypeSchemaResolver typeResolver, Components components,
+            List<String> pathTemplates) {
 
         Swagger3AnnotationReader.ParamInfo ann3 = swagger3.readParam(param);
         Swagger2AnnotationReader.ParamAnnotation ann2 = swagger2.readParam(param);
 
-        // 位置: @Parameter(in=...) 显式声明 > Spring 注解推断 > query 兜底
+        // 名称: @Parameter(name) / @ApiParam(name) > Java 参数名 (javadoc @param 按 Java 名匹配)
+        String name = OpenApiMerger.firstNonEmpty(
+                ann3 != null ? ann3.name : null,
+                ann2 != null ? ann2.name : null,
+                param.getNameAsString());
+
+        // 位置: @Parameter(in=...) 显式声明 > Spring 注解推断 > 路径模板推断 > query 兜底
         String in = ann3 != null && !ann3.in.isEmpty()
                 ? ann3.in
-                : determineParamLocation(param);
+                : determineParamLocation(param, pathTemplates);
 
         io.github.wanlianyida.staticopenapi.model.Parameter p =
                 new io.github.wanlianyida.staticopenapi.model.Parameter()
-                        .setName(param.getNameAsString())
+                        .setName(name)
                         .setIn(in);
 
         // path 参数默认必填
@@ -485,19 +573,12 @@ public class OpenApiGenerator {
         if (ann2 != null && ann2.required) p.setRequired(true);
         if (ann3 != null && ann3.required) p.setRequired(true);
 
-        Schema schema = typeResolver.resolve(param.getType(), components.getSchemas());
-        if (desc.isEmpty()) {
-            desc = javadoc.readParamDescription(param);
-        }
-        if (!desc.isEmpty() && schema.getRef() != null) {
-            schema.setDescription(desc);
-        }
-        p.setSchema(schema);
+        p.setSchema(typeResolver.resolve(param.getType(), components.getSchemas()));
         return p;
     }
 
-    /** 推断 OpenAPI parameter location: query/path/header */
-    private String determineParamLocation(Parameter param) {
+    /** 推断 OpenAPI parameter location: Spring 注解 > 路径模板命中 > query 兜底 */
+    private String determineParamLocation(Parameter param, List<String> pathTemplates) {
         for (var ann : param.getAnnotations()) {
             String n = ann.getNameAsString();
             int dot = n.lastIndexOf('.');
@@ -506,6 +587,14 @@ public class OpenApiGenerator {
                 case "PathVariable": return "path";
                 case "RequestHeader": return "header";
                 case "RequestParam": return "query";
+            }
+        }
+        // 未标注: 参数名出现在路径模板 {uid} 中 → path
+        String paramName = param.getNameAsString();
+        for (String template : pathTemplates) {
+            Matcher m = PATH_VAR_PATTERN.matcher(template);
+            while (m.find()) {
+                if (paramName.equals(m.group(1).trim())) return "path";
             }
         }
         return "query";

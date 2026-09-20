@@ -17,6 +17,8 @@ public class Schema {
     private Map<String, Schema> properties = new LinkedHashMap<>();
     private List<String> required = new ArrayList<>();
     private Schema items;           // array items
+    /** Map 值类型 schema (additionalProperties); null = 未声明 */
+    private Schema additionalProperties;
     private String example;
     private List<String> enumValues = new ArrayList<>();   // 枚举可选值 (序列化为 "enum")
 
@@ -40,11 +42,14 @@ public class Schema {
     public Schema setProperties(Map<String, Schema> properties) { this.properties = properties; return this; }
 
     public List<String> getRequired() { return required; }
-    public Schema addRequired(String name) { required.add(name); return this; }
+    public Schema addRequired(String name) { if (!required.contains(name)) required.add(name); return this; }
     public Schema setRequired(List<String> required) { this.required = required; return this; }
 
     public Schema getItems() { return items; }
     public Schema setItems(Schema items) { this.items = items; return this; }
+
+    public Schema getAdditionalProperties() { return additionalProperties; }
+    public Schema setAdditionalProperties(Schema additionalProperties) { this.additionalProperties = additionalProperties; return this; }
 
     public String getExample() { return example; }
     public Schema setExample(String example) { this.example = example; return this; }

@@ -8,6 +8,7 @@ import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
+import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import io.github.wanlianyida.staticopenapi.model.Tag;
 
 import java.util.ArrayList;
@@ -36,9 +37,6 @@ public class Swagger3AnnotationReader {
     private static final String NS_SCHEMA = "io.swagger.v3.oas.annotations.media.Schema";
     private static final String NS_REQUEST_BODY = "io.swagger.v3.oas.annotations.parameters.RequestBody";
     private static final String NS_API_RESPONSES = "io.swagger.v3.oas.annotations.responses.ApiResponses";
-    private static final String NS_API_RESPONSE = "io.swagger.v3.oas.annotations.responses.ApiResponse";
-    private static final String NS_CONTENT = "io.swagger.v3.oas.annotations.media.Content";
-    private static final String NS_ARRAY_SCHEMA = "io.swagger.v3.oas.annotations.media.ArraySchema";
 
     /** 读 class 级别 @Tag → Tag(name, description). */
     public Optional<Tag> readClassTag(ClassOrInterfaceDeclaration cls) {
@@ -130,33 +128,57 @@ public class Swagger3AnnotationReader {
                 .findFirst();
         if (ann.isEmpty()) return null;
         Map<String, ResponseInfo> responses = new LinkedHashMap<>();
-        AnnotationExpr responsesAnn = ann.get();
-        for (MemberValuePair pair : ((NormalAnnotationExpr) responsesAnn).getPairs()) {
-            if (!"value".equals(pair.getNameAsString())) continue;
-            if (!pair.getValue().isArrayInitializerExpr()) continue;
-            for (Expression item : pair.getValue().asArrayInitializerExpr().getValues()) {
-                if (!item.isNormalAnnotationExpr()) continue;
-                NormalAnnotationExpr respAnn = item.asNormalAnnotationExpr();
-                String responseCode = null;
-                String description = "";
-                for (MemberValuePair respPair : respAnn.getPairs()) {
-                    switch (respPair.getNameAsString()) {
-                        case "responseCode":
-                            responseCode = stringValue(respAnn, "responseCode");
-                            break;
-                        case "description":
-                            description = stringValue(respAnn, "description");
-                            break;
-                    }
-                }
-                if (responseCode == null || responseCode.isEmpty()) continue;
-                responses.put(responseCode, new ResponseInfo(description));
-            }
+        for (NormalAnnotationExpr respAnn : memberAnnotationList(ann.get(), "value")) {
+            // responseCode 官方是 String, 宽容支持 @ApiResponse(responseCode = 404) 的 int 写法
+            String responseCode = literalValue(respAnn, "responseCode");
+            if (responseCode.isEmpty()) continue;
+            responses.put(responseCode, new ResponseInfo(literalValue(respAnn, "description")));
         }
         return responses;
     }
 
     // ---- helpers ----
+
+    /**
+     * 取注解成员里的嵌套注解列表, 兼容三种写法:
+     * {@code @ApiResponses(value = {@ApiResponse, @ApiResponse})}、
+     * {@code @ApiResponses({@ApiResponse, @ApiResponse})}、
+     * {@code @ApiResponses(@ApiResponse)} (数组省略花括号, 解析为 SingleMemberAnnotationExpr).
+     */
+    static List<NormalAnnotationExpr> memberAnnotationList(AnnotationExpr ann, String key) {        List<NormalAnnotationExpr> out = new ArrayList<>();
+        Expression value = memberValue(ann, key);
+        if (value == null) return out;
+        if (value.isArrayInitializerExpr()) {
+            for (Expression item : value.asArrayInitializerExpr().getValues()) {
+                if (item.isNormalAnnotationExpr()) out.add(item.asNormalAnnotationExpr());
+            }
+        } else if (value.isNormalAnnotationExpr()) {
+            out.add(value.asNormalAnnotationExpr());
+        }
+        return out;
+    }
+
+    /** 注解成员值: Normal 按 key 取; SingleMember 等价于 value 成员 */
+    static Expression memberValue(AnnotationExpr ann, String key) {
+        if (ann instanceof NormalAnnotationExpr) {
+            for (MemberValuePair p : ((NormalAnnotationExpr) ann).getPairs()) {
+                if (p.getNameAsString().equals(key)) return p.getValue();
+            }
+            return null;
+        }
+        if (ann instanceof SingleMemberAnnotationExpr && "value".equals(key)) {
+            return ((SingleMemberAnnotationExpr) ann).getMemberValue();
+        }
+        return null;
+    }
+
+    /** 字面量文本: 字符串去掉引号, int/枚举引用取源码文本 */
+    private static String literalValue(AnnotationExpr ann, String key) {
+        Expression v = memberValue(ann, key);
+        if (v == null) return "";
+        if (v.isStringLiteralExpr()) return v.asStringLiteralExpr().getValue();
+        return v.toString();
+    }
 
     /** 字符串属性; 不支持常量引用等非常量表达式 (返回空串) */
     private String stringValue(AnnotationExpr ann, String key) {

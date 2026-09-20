@@ -1,7 +1,5 @@
 package io.github.wanlianyida.staticopenapi.reader;
 
-import com.github.javaparser.JavaParser;
-import com.github.javaparser.ParseResult;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.NodeList;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
@@ -98,6 +96,15 @@ public class TypeSchemaResolver {
             "LinkedHashSet", "TreeSet", "SortedSet", "Iterable", "Queue", "Deque",
             "Stack", "Vector"));
 
+    /** Map 类型: 解析为 object + additionalProperties (值类型取第二个泛型实参) */
+    private static final Set<String> MAP_TYPES = new HashSet<>(Arrays.asList(
+            "Map", "HashMap", "LinkedHashMap", "TreeMap", "SortedMap",
+            "NavigableMap", "ConcurrentMap", "ConcurrentHashMap", "Hashtable"));
+
+    /** 二进制包装: byte[]/Byte[] → string + format byte */
+    private static final Set<String> BINARY_TYPES = new HashSet<>(Arrays.asList("byte", "Byte"));
+
+    private final SourceParser sourceParser;
     private final Swagger2AnnotationReader swagger2 = new Swagger2AnnotationReader();
     private final Swagger3AnnotationReader swagger3 = new Swagger3AnnotationReader();
     private final JavaDocReader javadoc = new JavaDocReader();
@@ -112,7 +119,6 @@ public class TypeSchemaResolver {
      * 解析前先放入占位对象, 保证自引用类型命中缓存返回 $ref.
      */
     private final Map<String, Schema> schemaCache = new HashMap<>();
-    private static final JavaParser SHARED_PARSER = new JavaParser();
 
     public TypeSchemaResolver(List<Path> sourceRoots) {
         this(sourceRoots, "guillemet");
@@ -124,7 +130,12 @@ public class TypeSchemaResolver {
      *                        大小写不敏感; 其他值告警并回退 guillemet
      */
     public TypeSchemaResolver(List<Path> sourceRoots, String schemaNameStyle) {
+        this(sourceRoots, schemaNameStyle, new SourceParser());
+    }
+
+    public TypeSchemaResolver(List<Path> sourceRoots, String schemaNameStyle, SourceParser sourceParser) {
         this.sourceRoots = sourceRoots;
+        this.sourceParser = sourceParser;
         if ("pascal".equalsIgnoreCase(schemaNameStyle)) {
             this.pascalNaming = true;
         } else {
@@ -141,14 +152,17 @@ public class TypeSchemaResolver {
     private void indexSources() {
         for (Path root : sourceRoots) {
             if (!Files.isDirectory(root)) continue;
+            List<Path> files = new ArrayList<>();
             try (var stream = Files.walk(root)) {
-                stream.filter(p -> p.toString().endsWith(".java"))
-                        .forEach(p -> {
-                            String simple = stripExtension(p.getFileName().toString());
-                            sourceBySimpleName.putIfAbsent(simple, p);
-                        });
+                stream.filter(p -> p.toString().endsWith(".java")).forEach(files::add);
             } catch (IOException ignore) {
                 // skip
+            }
+            // 排序保证多模块/多文件时索引顺序确定 (同名简单类先到先得)
+            files.sort(Path::compareTo);
+            for (Path p : files) {
+                String simple = stripExtension(p.getFileName().toString());
+                sourceBySimpleName.putIfAbsent(simple, p);
             }
         }
     }
@@ -182,9 +196,13 @@ public class TypeSchemaResolver {
             if (m != null) return new Schema().setType(m.type).setFormat(m.format);
         }
 
-        // 2. 数组 (T[])
+        // 2. 数组 (T[]); byte[]/Byte[] 按惯例映射 string + format byte
         if (type instanceof ArrayType) {
-            Schema items = resolve(((ArrayType) type).getComponentType(), schemaCollector, typeVars);
+            Type component = ((ArrayType) type).getComponentType();
+            if (isBinaryComponent(component)) {
+                return new Schema().setType("string").setFormat("byte");
+            }
+            Schema items = resolve(component, schemaCollector, typeVars);
             return new Schema().setType("array").setItems(items);
         }
 
@@ -198,6 +216,16 @@ public class TypeSchemaResolver {
         return typeName == null || typeName.isEmpty()
                 ? new Schema().setType("object")
                 : resolveTypeString(typeName, schemaCollector, typeVars);
+    }
+
+    /** primitive schema 的 (type, format) 配对之外的 binary 判断: byte/Byte 的数组分量 */
+    private static boolean isBinaryComponent(Type component) {
+        String name = component instanceof PrimitiveType
+                ? component.asPrimitiveType().asString()
+                : component instanceof ClassOrInterfaceType
+                        ? shortName(component.asClassOrInterfaceType().getNameAsString())
+                        : null;
+        return name != null && BINARY_TYPES.contains(name);
     }
 
     // ================= 类型入口 =================
@@ -250,6 +278,9 @@ public class TypeSchemaResolver {
                                      Map<String, String> typeVars) {
         if (typeStr == null || typeStr.trim().isEmpty()) return new Schema().setType("object");
         String s = typeStr.trim();
+        if (s.equals("byte[]") || s.equals("Byte[]")) {
+            return new Schema().setType("string").setFormat("byte");
+        }
         if (s.endsWith("[]")) {
             return new Schema().setType("array")
                     .setItems(resolveTypeString(s.substring(0, s.length() - 2), collector, typeVars));
@@ -278,11 +309,20 @@ public class TypeSchemaResolver {
         if (!typeArgs.isEmpty() && WRAPPER_TYPES.contains(rawName)) {
             return resolveTypeString(typeArgs.get(0), collector, typeVars);
         }
-        // 3. 泛型实例化 → 真实替换形参 (ResultModel<UserVO>)
+        // 3. Map → object + additionalProperties (JDK 类无源码, 不走泛型实例化)
+        if (MAP_TYPES.contains(rawName)) {
+            Schema mapSchema = new Schema().setType("object");
+            if (typeArgs.size() >= 2) {
+                mapSchema.setAdditionalProperties(
+                        resolveTypeString(typeArgs.get(1), collector, typeVars));
+            }
+            return mapSchema;
+        }
+        // 4. 泛型实例化 → 真实替换形参 (ResultModel<UserVO>)
         if (!typeArgs.isEmpty()) {
             return resolveGenericInstantiation(rawName, typeArgs, collector);
         }
-        // 4. 绑定的类型变量 (controller 泛型方法返回 T 等)
+        // 5. 绑定的类型变量 (controller 泛型方法返回 T 等)
         if (typeVars.containsKey(rawName)) {
             return resolveTypeString(typeVars.get(rawName), collector, typeVars);
         }
@@ -305,22 +345,22 @@ public class TypeSchemaResolver {
         if (cached != null) return refTo(cached);
 
         try {
-            CompilationUnit unit = SHARED_PARSER.parse(sourceFile).getResult().orElse(null);
+            CompilationUnit unit = sourceParser.parse(sourceFile);
             if (unit != null) {
                 for (TypeDeclaration<?> td : unit.getTypes()) {
                     if (td instanceof ClassOrInterfaceDeclaration && td.getNameAsString().equals(rawName)) {
                         ClassOrInterfaceDeclaration cls = (ClassOrInterfaceDeclaration) td;
                         Map<String, String> typeVars = bindTypeVars(cls, typeArgs);
-                        Schema schema = new Schema().setName(key).setType("object");
+                        Schema schema = new Schema().setName(uniqueSchemaName(key, collector)).setType("object");
                         // 先占位再填充: 字段引用自身/原始类时命中缓存, 不会无限递归
                         schemaCache.put(key, schema);
-                        collector.put(key, schema);
+                        collector.put(schema.getName(), schema);
                         populateSchemaFromClass(cls, schema, collector, typeVars, new HashSet<>());
                         return refTo(schema);
                     }
                 }
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.warn("Failed to parse {}: {}", sourceFile, e.getMessage());
         }
         return buildFallbackSchema(rawName, typeArgs, collector);
@@ -365,7 +405,8 @@ public class TypeSchemaResolver {
 
     private boolean isLikelyResultWrapper(String name) {
         String n = name.toLowerCase();
-        return (n.contains("result") || n.contains("response") || n.contains("model"))
+        // 不含 "model": UserModel 等普通业务类名不应被误判为包装类型
+        return (n.contains("result") || n.contains("response"))
                 && !n.contains("page") && !n.contains("paging");
     }
 
@@ -435,7 +476,7 @@ public class TypeSchemaResolver {
 
         // 4. 按声明类型解析
         try {
-            CompilationUnit unit = SHARED_PARSER.parse(sourceFile).getResult().orElse(null);
+            CompilationUnit unit = sourceParser.parse(sourceFile);
             if (unit != null) {
                 for (TypeDeclaration<?> td : unit.getTypes()) {
                     if (td.getNameAsString().equals(simpleName)) {
@@ -443,22 +484,32 @@ public class TypeSchemaResolver {
                     }
                 }
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             log.warn("Failed to parse {}: {}", sourceFile, e.getMessage());
         }
         return new Schema().setType("object");
     }
 
+    /** 供 errorResponseSchema 等按名字补齐 components 的场景使用 */
+    public Schema resolveSchemaByName(String schemaName, Map<String, Schema> schemaCollector) {
+        if (schemaName == null || schemaName.isEmpty()) return new Schema().setType("object");
+        return resolveSimple(schemaName, schemaCollector);
+    }
+
     private Schema declareSchema(TypeDeclaration<?> td, String simpleName, Map<String, Schema> collector) {
         String effectiveName = schemaNameOverride(td, simpleName);
+        // 重名冲突唯一化 (如 @Schema(name="X") 与另一个类简单名撞名):
+        // 不覆盖既有 schema, 否则已生成的 $ref 会指向错误内容
+        if (collector.containsKey(effectiveName)) {
+            String renamed = uniqueSchemaName(effectiveName, collector);
+            log.warn("Duplicate schema name '{}' from class '{}', renamed to '{}'",
+                    effectiveName, simpleName, renamed);
+            effectiveName = renamed;
+        }
         Schema schema = new Schema().setName(effectiveName).setType("object");
         // 先占位再填充: 自引用/互引用 DTO 命中缓存返回 $ref, 不会 StackOverflow
         schemaCache.put(simpleName, schema);
-        Schema prev = collector.put(effectiveName, schema);
-        if (prev != null && prev != schema) {
-            log.warn("Duplicate schema name '{}' from class '{}', overriding previous definition",
-                    effectiveName, simpleName);
-        }
+        collector.put(effectiveName, schema);
 
         if (td instanceof EnumDeclaration) {
             populateEnum((EnumDeclaration) td, schema);
@@ -503,6 +554,16 @@ public class TypeSchemaResolver {
         }
     }
 
+    /** collector 内唯一化 schema 名: 撞名时追加 _2/_3… (引用侧以 schema.getName() 为准, 保持一致) */
+    private static String uniqueSchemaName(String desired, Map<String, Schema> collector) {
+        String name = desired;
+        int i = 2;
+        while (collector.containsKey(name)) {
+            name = desired + "_" + i++;
+        }
+        return name;
+    }
+
     /**
      * 类 → schema properties. 沿 extends 链递归合并父类字段 (父类在前),
      * 字段类型解析时用 typeVars 替换泛型形参.
@@ -518,18 +579,14 @@ public class TypeSchemaResolver {
             if (visited.contains(parentName)) continue;
             Path parentFile = sourceBySimpleName.get(parentName);
             if (parentFile == null) continue;
-            try {
-                CompilationUnit pUnit = SHARED_PARSER.parse(parentFile).getResult().orElse(null);
-                if (pUnit == null) continue;
-                for (TypeDeclaration<?> pTd : pUnit.getTypes()) {
-                    if (pTd instanceof ClassOrInterfaceDeclaration && pTd.getNameAsString().equals(parentName)) {
-                        // 父类泛形参不做跨类替换 (父类字段里的 T 解析为 object 兜底)
-                        populateSchemaFromClass((ClassOrInterfaceDeclaration) pTd, schema,
-                                schemaCollector, Collections.emptyMap(), visited);
-                    }
+            CompilationUnit pUnit = sourceParser.parse(parentFile);
+            if (pUnit == null) continue;
+            for (TypeDeclaration<?> pTd : pUnit.getTypes()) {
+                if (pTd instanceof ClassOrInterfaceDeclaration && pTd.getNameAsString().equals(parentName)) {
+                    // 父类泛形参不做跨类替换 (父类字段里的 T 解析为 object 兜底)
+                    populateSchemaFromClass((ClassOrInterfaceDeclaration) pTd, schema,
+                            schemaCollector, Collections.emptyMap(), visited);
                 }
-            } catch (IOException ignore) {
-                // skip unreachable parent
             }
         }
 
@@ -564,7 +621,11 @@ public class TypeSchemaResolver {
             boolean required = (p2 != null && p2.required) || (p3 != null && p3.required);
 
             for (VariableDeclarator var : field.getVariables()) {
-                String key = var.getNameAsString();
+                // 属性重命名: @Schema(name) / @ApiModelProperty(name) > Java 字段名
+                String key = OpenApiMerger.firstNonEmpty(
+                        p3 != null ? p3.name : null,
+                        p2 != null ? p2.name : null,
+                        var.getNameAsString());
                 Schema propSchema = resolve(var.getType(), schemaCollector, typeVars);
                 if (!propDesc.isEmpty()) propSchema.setDescription(propDesc);
                 if (!example.isEmpty()) propSchema.setExample(example);

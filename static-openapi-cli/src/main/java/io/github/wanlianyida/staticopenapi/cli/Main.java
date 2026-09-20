@@ -46,6 +46,7 @@ public class Main {
         String explicitOpenapiVersion = null;
         String explicitApiVersion = null;
         String explicitSchemaNameStyle = null;
+        String explicitErrorResponseSchema = null;
 
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
@@ -82,6 +83,10 @@ public class Main {
                     explicitSchemaNameStyle = nextArg(args, i, a);
                     i++;
                     break;
+                case "-errorResponseSchema":
+                    explicitErrorResponseSchema = nextArg(args, i, a);
+                    i++;
+                    break;
                 case "-h":
                 case "--help":
                     printHelp();
@@ -111,6 +116,7 @@ public class Main {
         if (explicitOpenapiVersion != null) config.setOpenapiVersion(explicitOpenapiVersion);
         if (explicitApiVersion != null) config.setApiVersion(explicitApiVersion);
         if (explicitSchemaNameStyle != null) config.setSchemaNameStyle(explicitSchemaNameStyle);
+        if (explicitErrorResponseSchema != null) config.setErrorResponseSchema(explicitErrorResponseSchema);
 
         // 优先级 3: 默认值 (仅补缺失; outPath 相对 projectDir, 配置文件已设置时不覆盖)
         if (explicitOutPath != null) {
@@ -167,6 +173,7 @@ public class Main {
         System.out.println("  -openapiVersion <v>  OpenAPI version: 3.0.0 / 3.1.0 (default 3.1.0)");
         System.out.println("  -apiVersion <ver>    API version in info.version (default v1.0.0)");
         System.out.println("  -schemaNameStyle <s> Generic schema naming: guillemet (default) / pascal (Apifox style)");
+        System.out.println("  -errorResponseSchema <n> Schema name for auto-generated 500 responses (e.g. ResultModel)");
         System.out.println();
         System.out.println("Examples:");
         System.out.println("  java -jar ... -projectDir /path/to/project \\");

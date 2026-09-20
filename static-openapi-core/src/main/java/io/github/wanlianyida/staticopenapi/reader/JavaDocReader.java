@@ -5,6 +5,7 @@ import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.TypeDeclaration;
+import com.github.javaparser.javadoc.JavadocBlockTag;
 
 /**
  * 读 JavaDoc 注释作为兜底. 优先级低于 swagger 注解.
@@ -58,27 +59,28 @@ public class JavaDocReader {
         return field.getJavadoc().map(j -> j.getDescription().toText()).orElse("").trim();
     }
 
+    /**
+     * 参数 javadoc 描述: 从所属方法的 javadoc 里找 @param 该参数名的 block tag.
+     * 注意 getDescription() 不含 block tag, 必须走 getBlockTags().
+     */
     public String readParamDescription(Parameter param) {
-        return "";
+        if (param == null) return "";
+        return param.findAncestor(MethodDeclaration.class)
+                .map(m -> readMethodParamDescription(m, param.getNameAsString()))
+                .orElse("");
     }
 
+    /** 方法 javadoc 里 @param paramName 的描述文本 (折行缩进折叠为空格); 无则空串 */
     public String readMethodParamDescription(MethodDeclaration method, String paramName) {
         if (method == null || paramName == null) return "";
-        String full = javadocText(method);
-        String marker = "@param " + paramName + " ";
-        int idx = full.indexOf(marker);
-        if (idx < 0) {
-            marker = "@param " + paramName;
-            idx = full.indexOf(marker);
-            if (idx < 0) return "";
-            idx += marker.length();
-        } else {
-            idx += marker.length();
-        }
-        int end = full.indexOf("@", idx);
-        String desc = end > idx ? full.substring(idx, end).trim() : full.substring(idx).trim();
-        int periodIdx = desc.indexOf("。");
-        return periodIdx > 0 ? desc.substring(0, periodIdx + 1) : desc;
+        return method.getJavadoc()
+                .map(jd -> jd.getBlockTags().stream()
+                        .filter(t -> t.getType() == JavadocBlockTag.Type.PARAM)
+                        .filter(t -> t.getName().map(paramName::equals).orElse(false))
+                        .map(t -> t.getContent().toText().replaceAll("\\s*\\n\\s*", " ").trim())
+                        .findFirst()
+                        .orElse(""))
+                .orElse("");
     }
 
     private static String javadocText(ClassOrInterfaceDeclaration cls) {

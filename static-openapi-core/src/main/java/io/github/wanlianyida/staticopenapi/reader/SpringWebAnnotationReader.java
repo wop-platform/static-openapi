@@ -90,38 +90,45 @@ public class SpringWebAnnotationReader {
     }
 
     private List<String> stringOrArray(AnnotationExpr ann, String... keys) {
-        // 1. 优先 NormalAnnotationExpr 的 value/path/method
+        List<String> keyList = Arrays.asList(keys);
+        // 1. NormalAnnotationExpr: 按 key 精确取 value/path/method
         if (ann instanceof NormalAnnotationExpr) {
             for (MemberValuePair p : ((NormalAnnotationExpr) ann).getPairs()) {
-                String name = p.getNameAsString();
-                for (String k : keys) {
-                    if (name.equals(k)) {
-                        return extractStrings(p.getValue());
-                    }
+                if (keyList.contains(p.getNameAsString())) {
+                    return extractStrings(p.getValue());
                 }
             }
+            return new ArrayList<>();
         }
-        // 2. SingleMemberAnnotationExpr: @PostMapping("/path")
-        if (ann instanceof SingleMemberAnnotationExpr) {
+        // 2. SingleMemberAnnotationExpr: @PostMapping("/path") 等价于 value="/path".
+        //    仅当请求的 key 包含 value 时才取, 否则会把路径误当成 method.
+        if (ann instanceof SingleMemberAnnotationExpr && keyList.contains("value")) {
             return extractStrings(((SingleMemberAnnotationExpr) ann).getMemberValue());
         }
         return new ArrayList<>();
     }
 
     private List<String> extractStrings(Expression expr) {
+        List<String> out = new ArrayList<>();
+        collectStrings(expr, out);
+        return out;
+    }
+
+    /** 字符串字面量 / RequestMethod.POST 枚举引用 / 其数组, 其余忽略 */
+    private static void collectStrings(Expression expr, List<String> out) {
         if (expr.isStringLiteralExpr()) {
-            return Collections.singletonList(expr.asStringLiteralExpr().getValue());
-        }
-        if (expr.isArrayInitializerExpr()) {
-            List<String> out = new ArrayList<>();
+            out.add(expr.asStringLiteralExpr().getValue());
+        } else if (expr.isFieldAccessExpr()) {
+            // RequestMethod.POST → "POST"; 全限定写法取最后一段
+            out.add(expr.asFieldAccessExpr().getNameAsString());
+        } else if (expr.isNameExpr()) {
+            // 静态导入的 POST
+            out.add(expr.asNameExpr().getNameAsString());
+        } else if (expr.isArrayInitializerExpr()) {
             for (Expression item : expr.asArrayInitializerExpr().getValues()) {
-                if (item.isStringLiteralExpr()) {
-                    out.add(item.asStringLiteralExpr().getValue());
-                }
+                collectStrings(item, out);
             }
-            return out;
         }
-        return new ArrayList<>();
     }
 
     public static class MappingInfo {

@@ -211,6 +211,9 @@ public class OpenApiWriter {
         }
         if (!s.getRequired().isEmpty()) map.put("required", s.getRequired());
         if (s.getItems() != null) map.put("items", schemaToMap(s.getItems()));
+        if (s.getAdditionalProperties() != null) {
+            map.put("additionalProperties", schemaToMap(s.getAdditionalProperties()));
+        }
         return map;
     }
 }

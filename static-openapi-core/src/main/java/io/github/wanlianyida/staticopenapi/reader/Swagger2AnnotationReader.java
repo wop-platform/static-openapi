@@ -34,7 +34,6 @@ public class Swagger2AnnotationReader {
     private static final String NS_API = "io.swagger.annotations.Api";
     private static final String NS_API_OPERATION = "io.swagger.annotations.ApiOperation";
     private static final String NS_API_RESPONSES = "io.swagger.annotations.ApiResponses";
-    private static final String NS_API_RESPONSE = "io.swagger.annotations.ApiResponse";
     private static final String NS_API_PARAM = "io.swagger.annotations.ApiParam";
     private static final String NS_API_MODEL = "io.swagger.annotations.ApiModel";
     private static final String NS_API_MODEL_PROPERTY = "io.swagger.annotations.ApiModelProperty";
@@ -66,20 +65,21 @@ public class Swagger2AnnotationReader {
         Optional<AnnotationExpr> ann = findAnnotation(method, NS_API_RESPONSES);
         if (ann.isEmpty()) return null;
         Map<String, ResponseAnnotation> responses = new LinkedHashMap<>();
-        AnnotationExpr responsesAnn = ann.get();
-        for (MemberValuePair pair : ((NormalAnnotationExpr) responsesAnn).getPairs()) {
-            if (!"value".equals(pair.getNameAsString())) continue;
-            if (!pair.getValue().isArrayInitializerExpr()) continue;
-            for (com.github.javaparser.ast.expr.Expression item : pair.getValue().asArrayInitializerExpr().getValues()) {
-                if (!item.isNormalAnnotationExpr()) continue;
-                NormalAnnotationExpr respAnn = item.asNormalAnnotationExpr();
-                String responseCode = stringValue(respAnn, "code");
-                String description = stringValue(respAnn, "message");
-                if (responseCode == null || responseCode.isEmpty()) continue;
-                responses.put(responseCode, new ResponseAnnotation(description));
-            }
+        for (NormalAnnotationExpr respAnn : Swagger3AnnotationReader.memberAnnotationList(ann.get(), "value")) {
+            // code 官方是 int, 但也宽容支持字符串写法; message 同理
+            String responseCode = literalValue(respAnn, "code");
+            if (responseCode.isEmpty()) continue;
+            responses.put(responseCode, new ResponseAnnotation(literalValue(respAnn, "message")));
         }
         return responses;
+    }
+
+    /** 字面量文本: 字符串去掉引号, int/枚举引用取源码文本 */
+    private static String literalValue(AnnotationExpr ann, String key) {
+        Expression v = Swagger3AnnotationReader.memberValue(ann, key);
+        if (v == null) return "";
+        if (v.isStringLiteralExpr()) return v.asStringLiteralExpr().getValue();
+        return v.toString();
     }
 
     /** 读 @ApiParam → parameter annotation. */

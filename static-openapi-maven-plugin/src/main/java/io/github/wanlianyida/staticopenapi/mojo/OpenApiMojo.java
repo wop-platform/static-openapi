@@ -3,7 +3,6 @@ package io.github.wanlianyida.staticopenapi.mojo;
 import io.github.wanlianyida.staticopenapi.OpenApiGenerator;
 import io.github.wanlianyida.staticopenapi.config.ConfigMerger;
 import io.github.wanlianyida.staticopenapi.config.GeneratorConfig;
-import org.apache.maven.execution.MavenSession;
 import org.apache.maven.plugin.AbstractMojo;
 import org.apache.maven.plugin.MojoExecution;
 import org.apache.maven.plugin.MojoExecutionException;
@@ -12,7 +11,6 @@ import org.apache.maven.plugins.annotations.Parameter;
 import org.apache.maven.project.MavenProject;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
 import java.io.File;
 import java.nio.file.Path;
 import java.util.List;
@@ -41,9 +39,6 @@ public class OpenApiMojo extends AbstractMojo {
 
     @Parameter(defaultValue = "${project}", readonly = true)
     private MavenProject project;
-
-    @Parameter(defaultValue = "${session}", readonly = true)
-    private MavenSession session;
 
     @Parameter(defaultValue = "${mojoExecution}", readonly = true)
     private MojoExecution mojoExecution;
@@ -78,13 +73,17 @@ public class OpenApiMojo extends AbstractMojo {
     @Parameter(property = "schemaNameStyle")
     private String schemaNameStyle;
 
+    /** 通用错误响应 schema 引用 (null = 不生成 500 response). 例如 "ResultModel" */
+    @Parameter(property = "errorResponseSchema")
+    private String errorResponseSchema;
+
     @Override
     public void execute() throws MojoExecutionException {
         // 直接调用 (default-cli) 只在 reactor 根模块执行一次:
         // 多模块 reactor 下 Maven 会对每个模块注入执行, 子模块没有根目录的配置文件,
         // 且会覆写输出文件, 因此跳过. 生命周期绑定 (executionId != default-cli) 不受影响.
         if (mojoExecution != null && "default-cli".equals(mojoExecution.getExecutionId())
-                && session != null && session.getTopLevelProject() != project) {
+                && project != null && !project.isExecutionRoot()) {
             log.info("Skipping static-openapi for non-root module '" + project.getArtifactId()
                     + "' (direct invocation runs once at the reactor root)");
             return;
@@ -135,6 +134,9 @@ public class OpenApiMojo extends AbstractMojo {
             }
             if (schemaNameStyle != null && !schemaNameStyle.isEmpty()) {
                 config.setSchemaNameStyle(schemaNameStyle);
+            }
+            if (errorResponseSchema != null && !errorResponseSchema.isEmpty()) {
+                config.setErrorResponseSchema(errorResponseSchema);
             }
 
             log.info("static-openapi starting. project={}, projectDir={}, packages={}",
