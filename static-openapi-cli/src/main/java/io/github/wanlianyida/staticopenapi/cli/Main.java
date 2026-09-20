@@ -165,19 +165,19 @@ public class Main {
     private static void printHelp() {
         System.out.println("Usage: java -jar static-openapi-cli.jar [options]");
         System.out.println("Options:");
-        System.out.println("  -configFile <path>    JSON configuration file (default: ./static-openapi.json)");
-        System.out.println("  -projectName <name>  API project name (default: openapi-doc)");
-        System.out.println("  -projectDir <path>   Project root directory (required)");
-        System.out.println("  -outPath <path>      Output directory (default: <projectDir>/target/static-openapi)");
-        System.out.println("  -packages <csv>      Comma-separated packages to scan (controller packages)");
-        System.out.println("  -openapiVersion <v>  OpenAPI version: 3.0.0 / 3.1.0 (default 3.1.0)");
-        System.out.println("  -apiVersion <ver>    API version in info.version (default v1.0.0)");
-        System.out.println("  -schemaNameStyle <s> Generic schema naming: guillemet (default) / pascal (Apifox style)");
+        System.out.println("  -configFile <path>       JSON configuration file (default: ./static-openapi.json)");
+        System.out.println("  -projectName <name>      API project name (default: openapi-doc)");
+        System.out.println("  -projectDir <path>       Project root directory (required)");
+        System.out.println("  -outPath <path>          Output directory (default: <projectDir>/target/static-openapi)");
+        System.out.println("  -packages <csv>          Comma-separated packages to scan (controller packages)");
+        System.out.println("  -openapiVersion <v>      OpenAPI version: 3.0.0 / 3.1.0 (default 3.1.0)");
+        System.out.println("  -apiVersion <ver>        API version in info.version (default v1.0.0)");
+        System.out.println("  -schemaNameStyle <s>     Generic schema naming: guillemet (default) / pascal (Apifox style)");
         System.out.println("  -errorResponseSchema <n> Schema name for auto-generated 500 responses (e.g. ResultModel)");
         System.out.println();
         System.out.println("Examples:");
-        System.out.println("  java -jar ... -projectDir /path/to/project \\");
+        System.out.println("  java -jar static-openapi-cli.jar -projectDir /path/to/project \\");
         System.out.println("                 -packages com.example.controller");
-        System.out.println("  java -jar ... -configFile ./static-openapi.json");
+        System.out.println("  java -jar static-openapi-cli.jar -configFile ./static-openapi.json");
     }
 }

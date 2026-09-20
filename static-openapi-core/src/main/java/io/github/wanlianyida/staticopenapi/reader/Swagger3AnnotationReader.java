@@ -64,18 +64,18 @@ public class Swagger3AnnotationReader {
                 stringArrayValue(op, "tags"));
     }
 
+    /** @Parameter(in) 的合法取值 (其他值视为未声明) */
+    private static final List<String> VALID_IN = List.of("path", "header", "query", "cookie");
+
     public ParamInfo readParam(Parameter param) {
         Optional<AnnotationExpr> ann = param.getAnnotations().stream()
                 .filter(a -> AnnotationUtils.matches(a, NS_PARAMETER))
                 .findFirst();
         if (ann.isEmpty()) return null;
-        // in 属性可能写字面量 ("path") 或枚举引用 (ParameterIn.PATH), 统一转小写
+        // in 属性可能写字面量 ("path") 或枚举引用 (ParameterIn.PATH), 统一转小写;
+        // 非法取值视为未声明, 交由调用方推断
         String in = expressionValue(ann.get(), "in").toLowerCase(Locale.ROOT);
-        if ("path".equals(in) || "header".equals(in) || "query".equals(in) || "cookie".equals(in)) {
-            // 合法取值, 直接使用
-        } else {
-            in = "";
-        }
+        if (!VALID_IN.contains(in)) in = "";
         return new ParamInfo(
                 stringValue(ann.get(), "name"),
                 stringValue(ann.get(), "description"),

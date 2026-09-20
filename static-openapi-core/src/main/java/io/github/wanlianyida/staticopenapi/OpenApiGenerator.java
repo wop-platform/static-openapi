@@ -81,30 +81,49 @@ public class OpenApiGenerator {
     private static final String RESPONSE_200 = "200";
     private static final String RESPONSE_500 = "500";
 
-    /** 复制 operation (用于 ANY method / 多 path 展开): parameter/response 逐个新建, 不共享实例 */
+    /**
+     * 复制 operation (用于 ANY method / 多 path 展开).
+     * parameter / response / requestBody 逐个新建, 不共享实例;
+     * schema 树只读, 仍共享引用.
+     */
     private static Operation copyOperation(Operation src) {
         Operation copy = new Operation()
                 .setSummary(src.getSummary())
                 .setDescription(src.getDescription())
                 .setOperationId(src.getOperationId())
-                .setDeprecated(src.isDeprecated())
-                .setRequestBody(src.getRequestBody());
+                .setDeprecated(src.isDeprecated());
         copy.setTags(new java.util.ArrayList<>(src.getTags()));
-        for (var p : src.getParameters()) {
-            copy.addParameter(new io.github.wanlianyida.staticopenapi.model.Parameter()
-                    .setName(p.getName())
-                    .setIn(p.getIn())
-                    .setDescription(p.getDescription())
-                    .setRequired(p.isRequired())
-                    .setSchema(p.getSchema())
-                    .setExample(p.getExample()));
-        }
-        for (var e : src.getResponses().entrySet()) {
-            Response r = new Response().setDescription(e.getValue().getDescription());
-            e.getValue().getContent().forEach(r::addContent);
-            copy.addResponse(e.getKey(), r);
-        }
+        for (var p : src.getParameters()) copy.addParameter(copyParameter(p));
+        if (src.getRequestBody() != null) copy.setRequestBody(copyRequestBody(src.getRequestBody()));
+        for (var e : src.getResponses().entrySet()) copy.addResponse(e.getKey(), copyResponse(e.getValue()));
         return copy;
+    }
+
+    private static io.github.wanlianyida.staticopenapi.model.Parameter copyParameter(
+            io.github.wanlianyida.staticopenapi.model.Parameter p) {
+        return new io.github.wanlianyida.staticopenapi.model.Parameter()
+                .setName(p.getName())
+                .setIn(p.getIn())
+                .setDescription(p.getDescription())
+                .setRequired(p.isRequired())
+                .setSchema(p.getSchema())
+                .setExample(p.getExample());
+    }
+
+    private static RequestBody copyRequestBody(RequestBody rb) {
+        RequestBody copy = new RequestBody().setDescription(rb.getDescription()).setRequired(rb.isRequired());
+        rb.getContent().forEach((type, mt) -> copy.addContent(type, copyMediaType(mt)));
+        return copy;
+    }
+
+    private static Response copyResponse(Response r) {
+        Response copy = new Response().setDescription(r.getDescription());
+        r.getContent().forEach(copy::addContent);
+        return copy;
+    }
+
+    private static MediaType copyMediaType(MediaType mt) {
+        return new MediaType().setSchema(mt.getSchema()).setExample(mt.getExample());
     }
 
     private final GeneratorConfig config;
@@ -271,6 +290,10 @@ public class OpenApiGenerator {
 
                 Operation operation = buildOperation(method, classTags, typeResolver, components, fullPaths);
                 String baseOperationId = operation.getOperationId();
+                if (mapping.httpMethods.contains(SpringWebAnnotationReader.ANY_METHOD)) {
+                    log.warn("@RequestMapping on {}.{}() without method, replicating to all standard methods",
+                            cls.getNameAsString(), method.getNameAsString());
+                }
 
                 // 多前缀 × 多路径 × 多 HTTP method 全部展开, 每个 operation 独立 operationId
                 boolean first = true;
@@ -280,13 +303,12 @@ public class OpenApiGenerator {
                         List<String> verbs = SpringWebAnnotationReader.ANY_METHOD.equals(httpMethod)
                                 ? STANDARD_METHODS
                                 : List.of(httpMethod);
-                        if (SpringWebAnnotationReader.ANY_METHOD.equals(httpMethod)) {
-                            log.warn("@RequestMapping on {}.{}() without method, replicating to all standard methods",
-                                    cls.getNameAsString(), method.getNameAsString());
-                        }
                         for (String verb : verbs) {
-                            if (item.getOperations().containsKey(verb)) {
-                                log.warn("Duplicate {} {} in {}, previous operation overwritten", verb, fullPath, javaFile);
+                            // PathItem 内部统一小写存储, 检测重复需同规格比较
+                            String verbKey = verb.toLowerCase(java.util.Locale.ROOT);
+                            if (item.getOperations().containsKey(verbKey)) {
+                                log.warn("Duplicate {} {} in {}, previous operation overwritten",
+                                        verbKey, fullPath, javaFile);
                             }
                             Operation toAdd;
                             if (first) {
@@ -296,7 +318,7 @@ public class OpenApiGenerator {
                                 toAdd = copyOperation(operation);
                             }
                             toAdd.setOperationId(uniqueOperationId(baseOperationId));
-                            item.addOperation(verb, toAdd);
+                            item.addOperation(verbKey, toAdd);
                         }
                     }
                 }
